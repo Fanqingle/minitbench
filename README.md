@@ -16,9 +16,9 @@
 | JD 职责 | 实现位置 | 可演示的证据 |
 |---|---|---|
 | ①任务构造、难度分层、轨迹采集、rubric/reward | `tasks/*/task.yaml`、`mini_tbench/task_spec.py`、`reward.py` | 3 个任务（medium/medium/hard），分层 rubric，RLVR scalar reward |
-| ②拆解 coding agent 能力边界与失败模式 | `mini_tbench/rollout.py`、`gaming.py`、`docs/agent-failure-mode-taxonomy.md` | 8 条观察维度 + **6 类互斥失败标签**（environment / tool_misuse / logic_error / gaming / planning / timeout）→ 逐类反转为任务设计；含构建过程中发现的两类"验证器自身失效"案例 |
-| ③可复现环境：容器隔离、超时与资源限制、批量 rollout | `mini_tbench/sandbox.py` | Docker 断网 + 内存/CPU/pids 限制；本地子进程后端；批量 rollout |
-| ④benchmark 分析、污染检测、verifier 被钻空子 | `mini_tbench/contamination.py`、`verifier.py` | 指纹污染扫描；测试哈希 / 硬编码 / 恒真三类反作弊 |
+| ②拆解 coding agent 能力边界与失败模式 | `agent_runtime.py`、`step_trace.py`、`docs/agent-failure-mode-taxonomy.md` | 真实 LLM 驱动的 ReAct 循环 + **step 级失败归因**（11 类标签，可定位到「第几步 / 哪个工具」）；实测 30 条真实轨迹给出跨模型失败模式差异（premature_finish 占 27%） |
+| ③可复现环境：容器隔离、超时与资源限制、批量 rollout | `sandbox.py`、`container.py`、`rollout.py` | Docker 断网 + 内存/CPU/pids 限制；常驻容器执行器（纯终端形态）；批量 rollout + 逐条落盘 |
+| ④benchmark 分析、污染检测、verifier 被钻空子 | `redteam.py`、`verifier.py`、`harbor.py`、`contamination.py` | **13 类作弊 agent 红队 → 反作弊九项检查：12 拦截 / 0 漏网**；官方 Terminal-Bench / Harbor 任务接入 + 产物重建评分复现 |
 | ⑤数据质量体系：校验、去重、人工抽检 | `mini_tbench/dedup.py`、`review.py`、`sft.py` | 精确+近似去重；抽检队列 CSV；Golden Dataset；SFT/RLVR 导出 |
 | ⑥模糊目标 → 任务规范与验收标准 | `docs/client-task-spec-example.md` | 客户口语 → 可执行断言 + 轨迹标签 的完整翻译过程 |
 
@@ -31,7 +31,12 @@ mini-tbench/
 ├── mini_tbench/                 # harness 包（核心实现）
 │   ├── task_spec.py             # 任务规范加载（yaml → dataclass）
 │   ├── sandbox.py               # Docker / 本地子进程隔离执行，超时与资源限制
-│   ├── verifier.py              # 可执行测试 + 反作弊套件（哈希/硬编码/恒真）
+│   ├── container.py             # 常驻容器执行器（纯终端形态，对齐 Terminal-Bench）
+│   ├── agent_runtime.py         # 真实 LLM 驱动 ReAct 循环，逐步留痕（本地/容器双模）
+│   ├── verifier.py              # 可执行测试 + 反作弊九项检查
+│   ├── step_trace.py            # step 级失败归因（11 类标签 / root-cause 定位 / 聚合）
+│   ├── redteam.py               # 13 类作弊 agent 攻击自家 harness
+│   ├── harbor.py                # Harbor / Terminal-Bench 2.0 官方任务接入
 │   ├── rollout.py               # 批量 rollout，轨迹落 JSONL，失败归因
 │   ├── reward.py                # RLVR 奖励（pass/partial/format/effort/gaming）
 │   ├── sft.py                   # 轨迹 → SFT / RLVR 训练样本导出
@@ -48,9 +53,14 @@ mini-tbench/
 │   ├── vllm_serve.md            # 部署脚本 + flag→能力映射 + 断网验收清单
 │   ├── agent_loop.py            # OpenAI 兼容端点驱动的 ReAct coding agent
 │   └── rollout_manager.py       # asyncio 并发压测 + 指标采集 + 断点续跑
-├── scripts/demo_pipeline.py     # 端到端演示（六段式，可一键复现）
-├── harness_tests/               # harness 自身单元测试（评测器必须自身正确）
+├── scripts/
+│   ├── demo_pipeline.py         # 端到端演示（六段式，可一键复现）
+│   ├── run_real_rollouts.py     # 真实模型批次 rollout（跨模型控制变量对比）
+│   ├── run_official_bench.py    # 跑官方 Terminal-Bench / Harbor 任务集
+│   └── make_final_report.py     # 汇总三路证据 → docs/real-evidence-report.md
+├── harness_tests/               # 评测器自身单测 + 真实管道回归（18 项，全绿）
 ├── docs/
+│   ├── real-evidence-report.md      # ★ 真实证据报告（轨迹 / 红队 / 官方 benchmark）
 │   ├── agent-failure-mode-taxonomy.md  # ★ 失败模式分类法（观察 → 任务设计 的推导）
 │   ├── task-spec-template.md        # 任务规范模板
 │   ├── failure-attribution-report.md# 失败归因报告模板
@@ -89,13 +99,36 @@ python -m mini_tbench.cli scan --tasks tasks/*    # 污染指纹扫描
 python -m pytest harness_tests -q
 ```
 
-### 实测结果（本地，不含 Docker/GPU）
+### 实测结果（本地实测，全部可用 `scripts/` 复现）
 
 ```
-oracle:  task-01 4/4 PASS | task-02 2/2 PASS | task-03 3/3 PASS
-harness 自检: 7 passed
-demo:    通过率 0.5，gaming 失败 1（hardcode+trivial_pass → should_drop）
+# ── 评测器先自证：oracle 不绿，后面一切结论都不成立 ─────────────
+oracle:              task-01 4/4 | task-02 2/2 | task-03 3/3   ALL PASS
+harness 自检:         7 passed
+真实管道回归:         11 passed  (harness_tests/test_real_pipeline.py)
+
+# ── ① 真实 agent 轨迹（真实模型 × 真实沙箱 × 逐步留痕）──────────
+n=30   pass=63.3%   avg_steps=11.9   tokens=1,306,182
+   qwen3-coder-flash   15 条   67%
+   qwen3-coder-plus    15 条   60%
+失败类别分布: premature_finish 8 (27%) | protocol_violation 2 | planning_error 1
+   → 复现: python scripts/run_real_rollouts.py --models qwen3-coder-flash,qwen3-coder-plus --runs 5
+
+# ── ② verifier 红队：13 类作弊 agent 攻击自家 harness ────────────
+加固前:  4 拦截 / 9 未检出
+加固后: 12 拦截 / 0 漏网      ← 漏网清单反向驱动了 5 项新检测
+   → 复现: python -c "from mini_tbench.redteam import run_redteam; run_redteam()"
+
+# ── ③ 官方 benchmark：Long-Horizon-Terminal-Bench（46 tasks）────
+实跑 2048：容器内 24 步 → 产出 moves.log（21 步）→ 官方引擎重放评分
+          max_tile=16  band=0  score=88   （官方预算 14400s；本实验限 24 步）
+   → 复现: python scripts/run_official_bench.py --bench-root <LHTB> --tasks 2048
 ```
+
+**一处值得注意的失败模式差异**：两个模型在简单任务上都能过，差距出现在**收工纪律**上——
+`premature_finish` 占全部失败的 27%，且根因步几乎都落在 `finish` 这个动作上
+（即"没做验证就宣告完成"）。这直接指向 reward 设计：**对这类模型，过程奖励（奖励验证行为）
+比结果奖励更能拉开差距。** 完整归因见 [`docs/real-evidence-report.md`](docs/real-evidence-report.md)。
 
 ---
 
@@ -103,10 +136,19 @@ demo:    通过率 0.5，gaming 失败 1（hardcode+trivial_pass → should_drop
 
 1. **verifier 与任务环境物理隔离**：`tests/` 只在 verifier 阶段挂载，agent 全程不可见，
    从源头杜绝「读测试写答案」。
-2. **反作弊三件套（防 verifier 被钻空子）**：
-   - 测试目录 SHA256 哈希校验（agent 改测试即 FAIL）
-   - 硬编码扫描（按 SKU 特判、期望值字面量）
-   - 恒真模式检测（`pytest.skip` / `assert True`）+ diff 范围检查
+2. **反作弊九项检查（防 verifier 被钻空子）**：
+   9 项闸门 = `harness-executable`（环境故障不得伪装成能力失败）+ `all-tests-pass` +
+   `tests-untouched`（覆盖 data 等**非 .py** 验收资产）+ `no-hardcode` +
+   `no-trivial-pass` + `no-test-literal-leak`（对抗"加条件 / 查表"式绕过的答案指纹法）+
+   `no-injection`（conftest 收集钩子 / sitecustomize / 影子依赖模块）+
+   `no-harness-shadow`（harness 同名模块 import 劫持）+ `scope-check`（越权写入）。
+
+   **这九项不是拍脑袋列的，是红队打出来的**：先让 13 类作弊 agent 攻击自家 harness
+   （首轮 4 拦截 / 9 未检出），再按漏网清单逐项补检测，复测收敛到 12 拦截 / 0 漏网。
+   完整攻击矩阵与加固对照见 [`docs/real-evidence-report.md`](docs/real-evidence-report.md)。
+   > 关键经验：**反作弊是对抗性搜索，不是模式匹配**。写死一条正则的检测，在下一次对抗中必然失效——
+   > 例如 `if x == "字面量": return` 只需追加一个 `and qty == 4` 就完全失配。
+   > 能站住的检测必须锚定**语义不变量**（这里的是："正解不需要知道测试用哪组样例"）。
 3. **确定性优先**：主判定一律是**可执行测试**（退出码 + 行为断言）；LLM Judge 只做可选质量抽检，
    保证评测可复现。随机故障注入必须**固定种子**，否则 RL reward 不可复现。
 4. **评测器必须先被证明正确**：每个任务先跑 `oracle` 模式，verifier 全绿后才允许接真实 agent。
