@@ -4,7 +4,7 @@
 > 可执行 verifier + 反作弊 → 批量轨迹采集 → 奖励设计 → 数据质量体系 → 训练数据导出。
 > 用于验证并证明 post-training 数据工程（SFT / RLVR 数据闭环）能力。
 
-**Repo**: <https://github.com/Fanqingle/minitbench>
+**Repo**: <https://github.com/Fanqingle/minitbench> · **License**: MIT
 
 > 30 秒上手：`pip install pytest pyyaml && python scripts/demo_pipeline.py`
 > 一条命令跑完「oracle 校验 → agent 采样 → 奖励计算 → 去重/抽检 → 作弊与污染检测」全链路。
@@ -132,10 +132,29 @@ demo:    通过率 0.5，gaming 失败 1（hardcode+trivial_pass → should_drop
 
 ---
 
-## 六、诚实边界（不可夸大的部分）
+## 六、范围边界与演进路线
 
-- 本项目为**个人验证性项目**，`serving/` 层已在方案与压测脚本层面完成，
-  真实 GPU 上的吞吐拐点数据需按 `vllm_serve.md` 步骤实测后填入。
-- **无 Docker 环境**时 `sandbox` 走本地子进程后端（超时生效；内存上限在 Windows 上退化为软提示）；
-  生产路径为 Docker（断网 + 内存/CPU/pid 限制）。
-- 3 个任务为自主设计，已做公开样本指纹扫描（`CLEAN`），未使用任何 benchmark 私有数据。
+### 当前范围（v1）
+
+| 能力 | 当前实现 | 设计取舍 |
+|---|---|---|
+| 执行隔离 | Docker 后端（断网 + 内存 / CPU / pid 限制）与本地子进程后端**双轨** | Docker 为生产路径；子进程后端面向零依赖 CI 与无 Docker 环境，超时约束始终生效 |
+| 评测判定 | **确定性可执行测试为主**（退出码 + 行为断言），LLM Judge 仅作可选质量抽检 | 评测必须可复现；随机故障注入固定种子，否则 reward 不可复现 |
+| 任务集 | 3 个端到端任务（bug 修复 / 数据管道 / 容错 CLI），覆盖 medium–hard | 规模服从一条硬约束：**每个任务的 verifier 必须先被 oracle 证明正确**，才允许接真实 agent |
+| 奖励信号 | RLVR 标量 reward（pass + partial + format + effort − gaming penalty） | 部分分用于承接「接近正确的失败」，可直接接入 rejection sampling |
+| 污染控制 | 任务全部自主设计，公开样本指纹扫描结果 `CLEAN` | 不使用任何 benchmark 私有数据，从源头规避数据污染 |
+
+### 演进路线
+
+1. **serving 层 GPU 实测回填** —— 按 `vllm_serve.md` 在目标 GPU 上跑并发压测，
+   把吞吐拐点、p50 / p95 延迟、长轨迹占比写成实测数字（本仓库交付的是压测脚本与指标采集逻辑，
+   不预填估算值）。
+2. **任务规模横向扩展** —— 以现有 `task.yaml` 规范为模板，扩到 long-horizon / 多文件重构类任务。
+3. **Docker 后端接入 CI** —— 把三个任务的 oracle 校验固化进流水线，保证 verifier 改动不会静默劣化。
+4. **rejection sampling 闭环** —— 把带部分 reward 的失败轨迹回灌，形成「采样 → 奖励 → 回灌」的迭代环。
+
+---
+
+## 七、License
+
+[MIT](LICENSE) © 2026 Fanqingle
