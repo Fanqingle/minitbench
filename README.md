@@ -16,7 +16,7 @@
 | JD 职责 | 实现位置 | 可演示的证据 |
 |---|---|---|
 | ①任务构造、难度分层、轨迹采集、rubric/reward | `tasks/*/task.yaml`、`mini_tbench/task_spec.py`、`reward.py` | 3 个任务（medium/medium/hard），分层 rubric，RLVR scalar reward |
-| ②拆解 coding agent 能力边界与失败模式 | `mini_tbench/rollout.py`、`gaming.py` | 失败归因标签（timeout / logic_error / gaming / tool_misuse），gaming 报告 |
+| ②拆解 coding agent 能力边界与失败模式 | `mini_tbench/rollout.py`、`gaming.py`、`docs/agent-failure-mode-taxonomy.md` | 8 条观察维度 + **6 类互斥失败标签**（environment / tool_misuse / logic_error / gaming / planning / timeout）→ 逐类反转为任务设计；含构建过程中发现的两类"验证器自身失效"案例 |
 | ③可复现环境：容器隔离、超时与资源限制、批量 rollout | `mini_tbench/sandbox.py` | Docker 断网 + 内存/CPU/pids 限制；本地子进程后端；批量 rollout |
 | ④benchmark 分析、污染检测、verifier 被钻空子 | `mini_tbench/contamination.py`、`verifier.py` | 指纹污染扫描；测试哈希 / 硬编码 / 恒真三类反作弊 |
 | ⑤数据质量体系：校验、去重、人工抽检 | `mini_tbench/dedup.py`、`review.py`、`sft.py` | 精确+近似去重；抽检队列 CSV；Golden Dataset；SFT/RLVR 导出 |
@@ -51,6 +51,7 @@ mini-tbench/
 ├── scripts/demo_pipeline.py     # 端到端演示（六段式，可一键复现）
 ├── harness_tests/               # harness 自身单元测试（评测器必须自身正确）
 ├── docs/
+│   ├── agent-failure-mode-taxonomy.md  # ★ 失败模式分类法（观察 → 任务设计 的推导）
 │   ├── task-spec-template.md        # 任务规范模板
 │   ├── failure-attribution-report.md# 失败归因报告模板
 │   └── client-task-spec-example.md  # 客户模糊目标 → 验收标准 翻译示例
@@ -113,6 +114,12 @@ demo:    通过率 0.5，gaming 失败 1（hardcode+trivial_pass → should_drop
 5. **轨迹即数据**：每次 rollout 落一条 JSONL（指令、agent 输出、diff、verifier 逐项结果、
    耗时、失败归因），天然就是 SFT / RLVR 的原始形态；成功轨迹 → SFT，接近正确的失败 →
    部分 reward（rejection sampling），作弊轨迹直接剔除。
+6. **失败分类法先于任务集**：先建立 **6 类互斥失败标签**（environment / tool_misuse / logic_error /
+   gaming / planning / timeout），再让每个任务去"堵"其中一类。**一个任务只有在"某类失败会因它而暴露"
+   时才有资格存在**，否则它只是在测模型的运气。推导过程与两类"验证器自身失效"的案例见
+   [`docs/agent-failure-mode-taxonomy.md`](docs/agent-failure-mode-taxonomy.md)。
+7. **验证器本身也在被测范围内**：验证器/奖励逻辑一改，必须重跑 oracle 全量 + `harness_tests/`，
+   不允许增量信任——因为**验证器的 bug 不会表现为 bug，它会表现为"模型变强了"**。
 
 ---
 
