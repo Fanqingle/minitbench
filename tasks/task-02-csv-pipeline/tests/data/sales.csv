@@ -1,0 +1,6 @@
+order_id,store,date,amount,type
+A1,S1,2024-01-01,100,normal
+A1,S1,2024-01-01,100,normal
+A2,S1,2024-01-01,,refund
+A3,S2,2024-01-02,50,normal
+A4,S2,2024-01-02,-20,refund

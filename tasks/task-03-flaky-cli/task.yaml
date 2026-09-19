@@ -1,0 +1,33 @@
+id: task-03-flaky-cli
+title: "给数据拉取 CLI 增加超时/重试/幂等能力"
+difficulty: hard
+category: robustness / fault-injection
+estimated_agent_steps: 15-25
+
+instruction: |
+  /workspace/fetch_cli.py 从 HTTP 端点拉取记录并落盘。生产环境端点存在：
+  随机超时、5xx、响应截断三种故障。请改造 CLI：
+  1. 单请求超时 3s，指数退避重试（最多 4 次，退避 0.5s/1s/2s/4s，允许 ±20% 抖动）
+  2. 已写入的记录不可重复落盘（响应可能重复投递，记录有唯一 id）
+  3. 最终失败输出明确错误码并保留已完成部分（部分成功语义）
+  验收将在故障注入环境下执行（agent 不可见注入器）。
+
+rubric:
+  - id: survives-fault-injection
+    type: executable
+    desc: "注入器以 40% 概率抛超时/5xx/截断，CLI 仍需在 60s 内完成全部拉取且数据完整"
+  - id: no-duplicate-writes
+    type: executable
+    desc: "输出文件中记录 id 无重复"
+  - id: respects-budget
+    type: executable
+    desc: "总耗时 ≤60s、进程内存 ≤256MB（资源约束也是验收标准）"
+  - id: retry-params-externalized
+    type: rubric
+    desc: "重试参数可通过环境变量覆盖（供 LLM Judge 抽检代码质量）"
+
+design_notes: |
+  - 故障注入器只挂在 verifier 容器：agent 无法通过「关掉故障」作弊
+  - 随机故障 → verifier 结果有随机性 → rollout 需固定注入种子，否则 reward 不可复现。
+    「给随机性固定种子」是 verifier 设计的典型坑，值得写进归因报告
+  - 该任务产出轨迹价值最高：长 horizon、多约束，天然适合 RL 而非 SFT

@@ -1,0 +1,6 @@
+# 运行 harness 与任务 verifier 所需依赖
+pytest>=7.0
+PyYAML>=6.0
+# 可选：服务层（serving/）自托管推理时需要（见 serving/vllm_serve.md）
+# openai>=1.0
+# aiohttp>=3.9

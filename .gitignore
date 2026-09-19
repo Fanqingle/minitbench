@@ -1,0 +1,32 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- Test / tooling caches ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Run artifacts (trajectories / workspaces / logs are regenerated) ----
+results/
+*.jsonl
+!tasks/**/*.jsonl
+runs/
+logs/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ---- Secrets (NEVER commit credentials) ----
+.env
+*.pem
+credentials.json

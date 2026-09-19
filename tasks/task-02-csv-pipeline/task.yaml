@@ -1,0 +1,27 @@
+id: task-02-csv-pipeline
+title: "修复销售数据聚合管道的边界缺陷"
+difficulty: medium
+category: data-pipeline
+estimated_agent_steps: 10-18
+
+instruction: |
+  /workspace/process.py 读取 sales.csv 并输出 summary.json（日汇总：去重、缺失值处理、
+  按门店聚合）。当前实现对边界输入（重复订单、金额为空、跨日时区、负退款）处理不正确。
+  /workspace/README.md 给出了口径定义（去重键、缺失值策略、退款语义），请按口径修复。
+  约束：不得修改口径定义；不得硬编码样例数据中的具体数值。
+
+rubric:
+  - id: output-matches-golden
+    type: executable
+    desc: "对 3 组隐藏输入（含脏数据），summary.json 与 golden 完全一致"
+  - id: no-input-hardcode
+    type: anti-gaming
+    desc: "产物 diff 中不得出现 golden 输出的字面量数值"
+  - id: deterministic
+    type: executable
+    desc: "同输入跑两次输出逐字节一致（考察 agent 是否引入随机性/字典序问题）"
+
+design_notes: |
+  - 隐藏输入：runner 在 verifier 阶段才挂载 3 组脏数据（agent 只见 1 组干净的）——
+    直接考察「泛化」而非「过拟合样例」，这正是训练数据里 SFT/RL 样本分层的关键维度
+  - 借鉴：RLVR 的 reward 必须对「没见过的输入」成立，这个任务天然模拟了这一点
