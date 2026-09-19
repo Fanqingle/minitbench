@@ -4,6 +4,11 @@
 > 可执行 verifier + 反作弊 → 批量轨迹采集 → 奖励设计 → 数据质量体系 → 训练数据导出。
 > 用于验证并证明 post-training 数据工程（SFT / RLVR 数据闭环）能力。
 
+**Repo**: <https://github.com/Fanqingle/minitbench>
+
+> 30 秒上手：`pip install pytest pyyaml && python scripts/demo_pipeline.py`
+> 一条命令跑完「oracle 校验 → agent 采样 → 奖励计算 → 去重/抽检 → 作弊与污染检测」全链路。
+
 ---
 
 ## 一、JD 六项职责 → 本项目实现对照
