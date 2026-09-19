@@ -127,15 +127,35 @@ def build_executor(task: HarborTask, **overrides):
 # ---------------------------------------------------------------------------
 # 镜像可用性兜底：官方预构建镜像不可达时，用官方 Dockerfile 精简自建
 # ---------------------------------------------------------------------------
-def _skip_run_block(line: str, text_lines: list[str], i: int) -> tuple[bool, int]:
-    """判断第 i 行是否是「需要整体跳过的 RUN 块」，返回 (是否跳过, 下一行下标)。"""
-    s = line.strip()
-    if not s.upper().startswith(("RUN APT-GET", "RUN APT ", "RUN PIP ", "RUN PIP3 ")):
-        return False, i
-    j = i
-    while text_lines[j].rstrip().endswith("\\") and j + 1 < len(text_lines):
-        j += 1
-    return True, j
+def _logical_blocks(text_lines: list[str]) -> list[list[str]]:
+    """把 Dockerfile 切成「逻辑行组」。
+
+    Dockerfile 用行尾反斜杠续行，一条 RUN 可能横跨十几行。**必须先按逻辑行
+    分组再判断**——按物理行判断会把一条 RUN 从中间劈开，生成出
+    `... for f in ...; do RUN printf ...` 这种损坏的 Dockerfile（实测踩到）。
+    """
+    blocks: list[list[str]] = []
+    cur: list[str] = []
+    for ln in text_lines:
+        cur.append(ln)
+        if not ln.rstrip().endswith("\\"):
+            blocks.append(cur)
+            cur = []
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+
+def _drop_block(block: list[str]) -> bool:
+    """该逻辑块是否整体丢弃：apt/pip 安装，或构建期访问被劫持的域名。"""
+    joined = " ".join(l.strip() for l in block)
+    upper = joined.upper()
+    first = block[0].strip().upper()
+    if first.startswith(("RUN APT-GET", "RUN APT ", "RUN PIP ", "RUN PIP3 ")):
+        return True
+    # 构建期从 raw.githubusercontent.com 拉素材：本机 hosts 被本地加速器劫持，
+    # build 时会挂死。官方自己写了 `|| true`，说明本就允许该素材缺失。
+    return "RAW.GITHUBUSERCONTENT.COM" in upper
 
 
 def slim_dockerfile(official_text: str) -> str:
@@ -143,42 +163,106 @@ def slim_dockerfile(official_text: str) -> str:
 
     目的：官方预构建镜像在国内加速器上可能 403（不可达），而官方 Dockerfile
     里的 apt-get / pip install 又依赖外网。任务的核心契约——引擎副本、
-    launcher 脚本、G2048_SEED / G2048_RUN_DIR 等 ENV——全部保留，
+    launcher 脚本、SOKOBAN_RUN_DIR / MARIO_SOCKET 等 ENV——全部保留，
     因此产物重放的确定性不受影响；被摘掉的 tmux / asciinema / opencv
     只是官方 agent harness 用于录制与渲染视频的依赖，与任务语义无关。
     """
-    lines = official_text.splitlines()
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        raw = lines[i]
-        if not raw.strip() or raw.strip().startswith("#"):
-            i += 1
+    kept: list[str] = []
+    for block in _logical_blocks(official_text.splitlines()):
+        first = block[0].strip()
+        if not first or first.startswith("#"):
+            kept.extend(l for l in block if l.strip() and not l.strip().startswith("#"))
             continue
-        skip, nj = _skip_run_block(raw, lines, i)
-        if skip:
-            i = nj + 1
+        if _drop_block(block):
             continue
-        out.append(raw)
-        i += 1
-    return "\n".join(out).rstrip() + "\n"
+        kept.extend(block)
+    return "\n".join(kept).rstrip() + "\n"
 
 
-def build_local_image(task: HarborTask, *, base: str = "python:3.11-slim",
-                      tag: str | None = None, timeout: int = 1200) -> str:
-    """用官方 Dockerfile 的精简版在本地构建镜像，返回 tag。"""
+def _inject_after_from(text: str, blocks: list[str]) -> str:
+    """把补回的依赖插到**第一条 FROM 之后、所有 RUN 之前**。
+
+    为什么不能直接追加到文件末尾：精简规则会摘掉 apt/pip 块，但个别任务在
+    **构建期**就要用这些包——例如 spot-scheduler-traces 的
+    `RUN python3 /app/harness/trace_generator.py` 需要 numpy。补回的包若写在
+    文件末尾，那条 RUN 早就先失败了（实测构建报 `ModuleNotFoundError: numpy`，
+    而报告里只会显示"构建失败"，看不出是顺序问题）。
+    """
+    if not blocks:
+        return text
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip().upper().startswith("FROM "):
+            return "\n".join(lines[: i + 1] + blocks + lines[i + 1:]) + "\n"
+    return "\n".join(blocks + lines) + "\n"
+
+
+def build_local_image(task: HarborTask, *, base: str | None = None,
+                      tag: str | None = None, timeout: int = 1200,
+                      keep_pip: list[str] | None = None,
+                      pip_index: str | None = None,
+                      keep_apt: list[str] | None = None,
+                      raw: bool = False) -> str:
+    """用官方 Dockerfile 精简版在本地构建镜像，返回 tag。
+
+    raw=True：**不做精简，按官方 Dockerfile 原样构建**。给那些"精简后语义已经
+    不完整"的任务用——例如 vector-db-iterative-build 的官方 Dockerfile 先 apt 装
+    python3.11，再 `update-alternatives --install ... /usr/bin/python3.11`；
+    把 apt 块摘掉后，那一步找不到解释器，直接失败。此时补 apt 是在猜官方
+    的依赖闭包，不如照抄。**精简是优化，不是目标；能跑通才算数。**
+
+    base：**默认 None = 逐字保留官方 FROM**。早期版本强制替换成
+    `python:3.11-slim`，这是个错：46 个任务的基础镜像并不统一
+    （`ubuntu:22.04` / `python:3.10-slim --platform=linux/amd64` / `python:3.11-slim`），
+    换掉 base 会连带换掉 OS 与 Python 布局。实测代价是
+    vector-db-iterative-build 里 `update-alternatives --install ... /usr/bin/python3.11`
+    直接失败（官方 base 是 ubuntu，python 在 /usr/bin；换成 python:3.11-slim 后
+    解释器在 /usr/local/bin），而 nbody / super-mario 虽然建成了却已被静默
+    改了 Python 版本。**忠实复现优先于"统一 base"**，只有原 base 拉不下来时才用 base 覆盖。
+
+    keep_pip：精简版会把 pip 安装块整体摘掉（多数是 verifier 侧的渲染/录制
+    依赖）。但少数任务的**引擎自身或构建步骤**需要某个包
+    （spot-scheduler-traces 用 numpy、grammar-fuzz-coverage-hunt 用 coverage），
+    摘掉会直接跑不起来，这些要通过 keep_pip 显式补回。
+
+    keep_apt：同理，个别任务的构建步骤需要 apt 装出来的工具
+    （duckdb-optimizer-closure 要 `git clone`、poc-exploit-craft 要 `make`）。
+    """
     ctx = task.dir / "environment"
     df = ctx / "Dockerfile"
     if not df.exists():
         raise FileNotFoundError(df)
-    slim = slim_dockerfile(df.read_text(encoding="utf-8"))
-    # 把基础镜像替换为已确认可用的官方镜像
-    slim = "\n".join(
-        (f"FROM {base}" if ln.strip().upper().startswith("FROM ") else ln)
-        for ln in slim.splitlines()) + "\n"
+    official = df.read_text(encoding="utf-8")
+    slim = official if raw else slim_dockerfile(official)
+    if base:
+        slim = "\n".join(
+            (f"FROM {base}" if ln.strip().upper().startswith("FROM ") else ln)
+            for ln in slim.splitlines()) + "\n"
+    # 补回的依赖必须插在 FROM 之后、所有 RUN 之前（见 _inject_after_from）
+    inject: list[str] = []
+    if keep_apt:
+        inject.append("RUN apt-get update && apt-get install -y --no-install-recommends "
+                      + " ".join(keep_apt)
+                      + " && rm -rf /var/lib/apt/lists/*")
+    if keep_pip:
+        idx = f" -i {pip_index}" if pip_index else ""
+        # ★ 必须自带 pip 引导：基础镜像不统一，`ubuntu:22.04` 这类 base 本镜像里
+        # 没有 pip（pip 是被精简规则摘掉的那条 apt 块装上的）。若直接 `pip install`，
+        # 会以 "pip: not found" 失败——而报错只显示 pip 命令行，看不出是 base 问题。
+        inject.append(
+            "RUN if ! command -v pip >/dev/null 2>&1; then "
+            "apt-get update && apt-get install -y --no-install-recommends python3-pip "
+            "&& rm -rf /var/lib/apt/lists/*; fi && "
+            "pip install --no-cache-dir" + idx + " "
+            + " ".join(f'"{p}"' for p in keep_pip))
+    if inject:
+        inject = ["# kept deps (engine / build-step requirements, restored by hand)"] + inject
+    slim = _inject_after_from(slim, inject)
     tmp_df = ctx / ".slim.Dockerfile"
     tmp_df.write_text(slim, encoding="utf-8")
     tag = tag or f"lhtb-local-{task.slug}:slim"
+    if raw:
+        tag = tag.replace(":slim", ":raw")
     r = subprocess.run(["docker", "build", "-f", tmp_df.name, "-t", tag, "."],
                        cwd=str(ctx), capture_output=True, text=True,
                        timeout=timeout, encoding="utf-8", errors="replace")
@@ -187,9 +271,41 @@ def build_local_image(task: HarborTask, *, base: str = "python:3.11-slim",
     return tag
 
 
+def _image_present(tag: str) -> bool:
+    if not tag:
+        return False
+    r = subprocess.run(["docker", "image", "inspect", tag],
+                       capture_output=True, text=True, timeout=120,
+                       encoding="utf-8", errors="replace")
+    return r.returncode == 0
+
+
 def ensure_image(task: HarborTask, *, force_build: bool = False,
-                 base: str = "python:3.11-slim", log=print) -> tuple[str, str]:
-    """确保有可用镜像。返回 (image, source)，source ∈ {official, local-slim}。"""
+                 base: str | None = None, log=print,
+                 keep_pip: list[str] | None = None,
+                 pip_index: str | None = None,
+                 keep_apt: list[str] | None = None,
+                 raw: bool = False) -> tuple[str, str]:
+    """确保有可用镜像。返回 (image, source)，source ∈ {local, official, local-rebuild}。
+
+    顺序刻意是「本地镜像 → 官方镜像 → 现场重建」：
+    官方预构建镜像在国内加速器上常 403，每次都先去 pull 会白白等一轮超时；
+    而本地构建的镜像一旦成功就是稳定的，重复跑任务应直接命中。
+
+    base 默认 None：**保留官方 FROM**，不强行统一基础镜像
+    （46 任务里 base 有 python:3.11-slim / python:3.10-slim / ubuntu:22.04 三种）。
+    raw=True（见 build_local_image）时本地标签是 `:raw` 而非 `:slim`，两种都查。
+    """
+    local_tag = f"lhtb-local-{task.slug}:{'raw' if raw else 'slim'}"
+    alt_tag = f"lhtb-local-{task.slug}:{'slim' if raw else 'raw'}"
+    if not force_build:
+        for cand in (local_tag, alt_tag):
+            if _image_present(cand):
+                log(f"[image] reuse local image {cand}")
+                return cand, "local"
+    if not force_build and _image_present(task.image):
+        log(f"[image] reuse official image {task.image}")
+        return task.image, "official"
     if not force_build:
         r = subprocess.run(["docker", "pull", task.image], capture_output=True,
                            text=True, timeout=1800, encoding="utf-8",
@@ -201,8 +317,9 @@ def ensure_image(task: HarborTask, *, force_build: bool = False,
         log(f"[image] official pull failed: {tail[0][:180]}")
     else:
         log("[image] force_build=True, skipping official pull")
-    log(f"[image] building slim image from official Dockerfile "
-        f"({task.dir / 'environment' / 'Dockerfile'})")
-    tag = build_local_image(task, base=base)
-    log(f"[image] built local slim image {tag}")
-    return tag, "local-slim"
+    log(f"[image] building {'RAW' if raw else 'slim'} image from official "
+        f"Dockerfile ({task.dir / 'environment' / 'Dockerfile'})")
+    tag = build_local_image(task, base=base, keep_pip=keep_pip,
+                            pip_index=pip_index, keep_apt=keep_apt, raw=raw)
+    log(f"[image] built local image {tag}")
+    return tag, "local-rebuild"

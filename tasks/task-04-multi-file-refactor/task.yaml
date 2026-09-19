@@ -1,0 +1,90 @@
+id: task-04-multi-file-refactor
+title: "把三份互相分歧的计费实现重构为单一职责的模块结构"
+difficulty: hard
+category: refactoring / long-horizon / regression-preservation
+estimated_agent_steps: 50-90   # 完成全部 7 条约束所需步数的估计；实测远低于此，见 design_notes
+
+instruction: |
+  /workspace 是一个订单计费引擎。历史原因，税与折扣的实现被复制到了三个模块
+  （billing/legacy.py、billing/helpers.py、billing/report.py），三份在后续
+  维护中各自被改过，现在对同一张订单会算出不同的钱。请重构为职责清晰的模块
+  结构，并让三处分歧收敛到唯一实现。
+
+  验收会逐条检查以下约束：
+
+  1. 模块结构必须拆分为：
+       billing/models.py    数据模型（订单、行项目）
+       billing/tax.py       唯一的税计算实现
+       billing/discount.py  等级折扣与券折扣
+       billing/pricing.py   订单定价主流程
+       billing/report.py    发票渲染
+  2. billing.tax 暴露 calc_tax(net: Decimal, region: str) -> Decimal，
+     必须以 Decimal 计算并以 ROUND_HALF_UP 舍入——金额不得走 float 运算。
+     未知地区税率为 0。
+  3. billing.discount 暴露两个函数：
+       apply_discounts(net: Decimal, tier_rate: Decimal, coupon_rate: Decimal) -> Decimal
+       clamp_rate(r: float) -> float
+     多档折扣按「逐层相乘」叠加（10% + 10% 应为 0.81 而非 0.80）；
+     clamp_rate 把折扣率限制在 [0, 1]。
+  4. billing.pricing 暴露 price_order(order) -> dict，返回
+     subtotal / discount / net / tax / total 五项，数值为 float 且保留 2 位小数。
+  5. 兼容性：billing.compute_total(order) 与 run_billing.py 必须继续可用，
+     且结果与 price_order 完全一致——老调用方不能挂。
+  6. 边界必须显式定义：空订单、以及任何数量 <= 0 的行，必须抛 ValueError。
+     现状是静默算成 0，财务对账时才发现。
+  7. 上述公开函数必须有完整的类型注解。
+
+  不得改动：发票文本格式（外部对账系统按固定格式解析）、
+  run_billing.py 的输出结构。
+
+rubric:
+  - id: modules-split
+    type: executable
+    desc: "billing/{models,tax,discount,pricing,report}.py 五个模块存在且可导入"
+  - id: tax-unified-decimal
+    type: executable
+    desc: "calc_tax 返回 Decimal 且按 ROUND_HALF_UP 舍入（38.50 起 13% 税 = 5.01）"
+  - id: tax-paths-converged
+    type: executable
+    desc: "legacy 兼容入口与权威实现口径一致；helpers/report 的重复实现不再产生分歧"
+  - id: discounts-compound
+    type: executable
+    desc: "折扣逐层相乘（0.90*0.90=0.81）；折扣率被 clamp 到 [0,1]"
+  - id: entrypoints-consistent
+    type: executable
+    desc: "price_order 与 compute_total 对新旧订单结果完全一致，run_billing.py 输出不变"
+  - id: boundaries-explicit
+    type: executable
+    desc: "空订单 / qty<=0 抛 ValueError，而非静默返回 0"
+  - id: typed-public-api
+    type: executable
+    desc: "calc_tax / apply_discounts / price_order 具备完整参数与返回值类型注解（AST 校验）"
+  - id: invoice-format-frozen
+    type: rubric
+    desc: "发票文本格式逐字保持（外部对账系统契约），供 LLM Judge 复核是否被顺手改漂亮"
+
+design_notes: |
+  - 这是本套件唯一的 **多文件重构型长程任务**：初始代码可运行、冒烟测试全绿，
+    但三条税路径已分歧、边界静默、无类型注解。agent 必须先读懂三份实现的分歧
+    点（而不是照着报错改），因此任务规模本身在 50–90 步量级——这是 Long-Horizon
+    benchmark 的主场形态，单文件修 bug 类任务覆盖不到。
+  - **实测结果与设计预期的落差，本身就是最有价值的产出**（qwen3-coder-flash 3 条
+    + qwen3-coder-plus 3 条，max_steps=90）：6/6 条 `stop_reason=finish`，
+    实际步数仅 **21–26 步**，隐藏验收稳定停在 **2/19**——agent 只改了税那一处、
+    **完全没建新模块**就宣告"已成功统一税计算实现"。
+    即：**任务规模在 50–90 步，模型却只用 21–26 步就自认做完了。**
+    这与 30 条真实轨迹里 `premature_finish` 占 27%、以及官方 2048 放开到 120 步
+    仍停在 `max_steps` 互为印证——**模型对"什么时候算完"没有校准**。
+    因此本任务不应被当作"能跑出长轨迹的任务"，而应被当作
+    「**长程失败模式探测器**」。若需要真正跑满 50+ 步的轨迹，用官方长程任务
+    （如 2048 放开步数预算）更直接，见 `docs/official-benchmark-report.md`。
+  - **初始 workspace 必须让隐藏测试失败**：legacy 用 round()（银行家舍入）、
+    helpers 用折扣率相加、report 用 int() 截断，三处各自至少违反一条断言。
+    同时 tests_local/ 冒烟测试必须全绿——「可见测试全过但语义还是错的」正是
+    真实遗留代码的常态，也是本任务考察的核心。
+  - 隐藏测试只断言**可观测行为**（返回类型、数值、异常、AST 注解、文本格式），
+    不规定实现路径：agent 可以删掉 helpers 的重复实现、也可以改成转发，
+    只要对外契约成立。
+  - `legacy.region_tax` 一致性检查做成「模块被删则 skip」：允许 agent 迁移
+    兼容面，但不允许留下一个口径不同的旧入口。这是「消除重复」与
+    「保持兼容」两条约束的交汇点，也是最容易做错的一步。

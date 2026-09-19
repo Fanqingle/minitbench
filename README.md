@@ -37,6 +37,7 @@ mini-tbench/
 │   ├── step_trace.py            # step 级失败归因（11 类标签 / root-cause 定位 / 聚合）
 │   ├── redteam.py               # 13 类作弊 agent 攻击自家 harness
 │   ├── harbor.py                # Harbor / Terminal-Bench 2.0 官方任务接入
+│   ├── official_score.py        # 官方任务的产物重建评分（本地可复现的那部分）
 │   ├── rollout.py               # 批量 rollout，轨迹落 JSONL，失败归因
 │   ├── reward.py                # RLVR 奖励（pass/partial/format/effort/gaming）
 │   ├── sft.py                   # 轨迹 → SFT / RLVR 训练样本导出
@@ -48,7 +49,8 @@ mini-tbench/
 ├── tasks/
 │   ├── task-01-fix-failing-tests/   # medium：逻辑 bug 修复（边界/幂等/单位换算）
 │   ├── task-02-csv-pipeline/        # medium：数据管道口径（去重/缺失值/退款/确定性）
-│   └── task-03-flaky-cli/           # hard  ：容错 CLI（超时/退避重试/幂等/部分成功）
+│   ├── task-03-flaky-cli/           # hard  ：容错 CLI（超时/退避重试/幂等/部分成功）
+│   └── task-04-multi-file-refactor/ # hard  ：长程多文件重构（任务规模 50–90 步；见 docs/）
 ├── serving/                     # 服务层：vLLM/SGLang 私有化自托管 + 并发/长上下文/稳定性
 │   ├── vllm_serve.md            # 部署脚本 + flag→能力映射 + 断网验收清单
 │   ├── agent_loop.py            # OpenAI 兼容端点驱动的 ReAct coding agent
@@ -57,10 +59,14 @@ mini-tbench/
 │   ├── demo_pipeline.py         # 端到端演示（六段式，可一键复现）
 │   ├── run_real_rollouts.py     # 真实模型批次 rollout（跨模型控制变量对比）
 │   ├── run_official_bench.py    # 跑官方 Terminal-Bench / Harbor 任务集
+│   ├── build_official_images.py # 先把可自建的官方镜像建好（构建可重复、跑批不可重复）
+│   ├── scan_official_tasks.py   # 官方 46 任务画像 + 反作弊设计取证
+│   ├── make_official_report.py  # 汇总 → docs/official-benchmark-report.md
 │   └── make_final_report.py     # 汇总三路证据 → docs/real-evidence-report.md
-├── harness_tests/               # 评测器自身单测 + 真实管道回归（18 项，全绿）
+├── harness_tests/               # 评测器自身单测 + 真实管道回归 + 镜像精简逻辑（29 项，全绿）
 ├── docs/
 │   ├── real-evidence-report.md      # ★ 真实证据报告（轨迹 / 红队 / 官方 benchmark）
+│   ├── official-benchmark-report.md # ★ 官方 46 任务画像 + 反作弊设计图谱 + 实跑结果
 │   ├── agent-failure-mode-taxonomy.md  # ★ 失败模式分类法（观察 → 任务设计 的推导）
 │   ├── task-spec-template.md        # 任务规范模板
 │   ├── failure-attribution-report.md# 失败归因报告模板
@@ -103,9 +109,10 @@ python -m pytest harness_tests -q
 
 ```
 # ── 评测器先自证：oracle 不绿，后面一切结论都不成立 ─────────────
-oracle:              task-01 4/4 | task-02 2/2 | task-03 3/3   ALL PASS
-harness 自检:         7 passed
-真实管道回归:         11 passed  (harness_tests/test_real_pipeline.py)
+oracle:          task-01 4/4 | task-02 2/2 | task-03 3/3 | task-04 19/19    ALL PASS
+harness 回归:     29 passed  (harness_tests/)
+task-04 基线对照: 初始代码 17/19 红 · 可见冒烟测试 2/2 绿
+                  ← 「可见测试全绿、语义已错」＝ 真实遗留代码的常态
 
 # ── ① 真实 agent 轨迹（真实模型 × 真实沙箱 × 逐步留痕）──────────
 n=30   pass=63.3%   avg_steps=11.9   tokens=1,306,182
@@ -120,15 +127,49 @@ n=30   pass=63.3%   avg_steps=11.9   tokens=1,306,182
    → 复现: python -c "from mini_tbench.redteam import run_redteam; run_redteam()"
 
 # ── ③ 官方 benchmark：Long-Horizon-Terminal-Bench（46 tasks）────
-实跑 2048：容器内 24 步 → 产出 moves.log（21 步）→ 官方引擎重放评分
-          max_tile=16  band=0  score=88   （官方预算 14400s；本实验限 24 步）
-   → 复现: python scripts/run_official_bench.py --bench-root <LHTB> --tasks 2048
+全量画像: 46 任务 · 14 个自带 harness（可离线自重建设镜像）· 反作弊设计覆盖取证
+步数预算对照（2048，同模型同镜像，仅放开步数上限）：
+   24 步 → max_tile=16    band=0/11   score=88
+  120 步 → max_tile=128   band=2/11   score=1168        ← 13×，两轮均停在 max_steps
+实跑覆盖: 12 个任务（14 个可自建任务里的 12 个；另 2 个有明确原因建不出来）
+   stop_reason: finish 7 · max_steps 4 · loop 1
+   典型：sokoban 15 步 → levels_solved=0
+         snake_maze 60 步 → 173 次移动 · 吃掉 0 个食物 · band 0/10
+         super-mario 8 步 → frames.log 为空
+         spot-scheduler-traces 15 步 → 产物齐备（policy.py + simulation_results.json）
+         tabular-data-feature-covshift 33 步 → 交出 93KB submitted_model.pkl
+   → 复现: python scripts/build_official_images.py --bench-root <LHTB>   # 先建镜像
+           python scripts/run_official_bench.py --bench-root <LHTB> --tasks 2048
+
+官方任务的先验：**比"算错"更靠前的失败层是"交不出可被评分的产物"**。
+官方用「产物重放」把评分锚在产物上（agent 自报的一律不算分），因此
+agent 在长程任务上的第一道坎不是正确性，而是**能不能把工作推进到交卷**。
+实测 12 条记录、27 个声明产物里有 3 个为"存在但内容为空"——工具调用成功了、
+语义没落地。本地 runner 早期把「不存在」和「空」合成一个 `missing` 口径，
+分不清该修 prompt 还是该修工具；更早的版本还让异常直接把整条记录吞掉，
+**这个失败层就此从报告里消失**——与「pytest total==0 被静默兜底」同一族。
+
+**一个反向对照（环境即实验条件）**：早期为了整齐，把 46 个任务的 `FROM`
+统一换成 `python:3.11-slim`（官方其实有三种 base）。改回逐字保留官方 FROM 后
+重跑同一批：`super-mario` 从 `timeout`（21 步 / 913s）变成 `finish`（8 步 / 41s）。
+同一模型、同一 prompt，唯一变量是镜像 base —— 所以构建侧的"优化"若改变了
+被测量的东西，产出的数字就不该拿去和 leaderboard 比。
+
+# ── ④ 长程任务 task-04（多文件重构，任务规模 50–90 步）───────────
+agent 6 条（flash 3 + plus 3）: stop 全为 finish，步数 21–26（上限 90）
+                                 隐藏验收稳定 2/19 —— 只改了税、完全没建新模块
+   → 任务规模 50–90 步，模型 21–26 步就自认做完：长程失败模式探测器
 ```
 
 **一处值得注意的失败模式差异**：两个模型在简单任务上都能过，差距出现在**收工纪律**上——
 `premature_finish` 占全部失败的 27%，且根因步几乎都落在 `finish` 这个动作上
 （即"没做验证就宣告完成"）。这直接指向 reward 设计：**对这类模型，过程奖励（奖励验证行为）
 比结果奖励更能拉开差距。** 完整归因见 [`docs/real-evidence-report.md`](docs/real-evidence-report.md)。
+
+**同一条规律在长程任务上反向显形**：把 2048 的步数预算从 24 放到 120，模型从不主动收尾
+（两轮都停在 `max_steps`）；而在需要 50–90 步的重构任务上，它只用 21–26 步就交卷。
+**两个方向都错 → 模型对"什么时候算完"没有校准**，这正是 verifier 与 rubric 必须兜住的地方。
+官方任务的反作弊设计与实跑细节见 [`docs/official-benchmark-report.md`](docs/official-benchmark-report.md)。
 
 ---
 

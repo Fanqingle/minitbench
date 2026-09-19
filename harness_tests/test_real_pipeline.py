@@ -29,6 +29,7 @@ from mini_tbench.verifier import (                        # noqa: E402
 TASK01 = ROOT / "tasks" / "task-01-fix-failing-tests"
 TASK02 = ROOT / "tasks" / "task-02-csv-pipeline"
 TASK03 = ROOT / "tasks" / "task-03-flaky-cli"
+TASK04 = ROOT / "tasks" / "task-04-multi-file-refactor"
 
 
 def _fresh_ws(tmp_path: Path, task) -> Path:
@@ -148,7 +149,7 @@ def test_redteam_intercepts_majority(tmp_path):
 # ---------------------------------------------------------------------------
 # 基线：oracle 必须全绿（否则一切结论不成立）
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("task_dir", [TASK01, TASK02, TASK03])
+@pytest.mark.parametrize("task_dir", [TASK01, TASK02, TASK03, TASK04])
 def test_oracle_is_green(tmp_path, task_dir):
     task = load_task(task_dir)
     tr = do_rollout(task, f"regress-{task_dir.name}", mode="oracle",
@@ -156,3 +157,25 @@ def test_oracle_is_green(tmp_path, task_dir):
     assert tr.verdict == "PASS", [
         c for c in tr.meta["checks"] if not c["passed"]]
     assert tr.tests_passed == tr.tests_total > 0
+
+
+# ---------------------------------------------------------------------------
+# task-04 设计不变量：初始代码必须「可见全绿 / 隐藏大面积红」
+# ---------------------------------------------------------------------------
+def test_task04_baseline_is_visibly_green_but_semantically_red(tmp_path):
+    """长程重构任务的核心设计：**失败不靠报错驱动**。
+
+    初始代码可运行、可见冒烟测试全绿，但隐藏验收大面积失败——agent 必须自己
+    读懂三份实现的分歧才能动手，而不是照着报错改。若哪天初始 workspace 被改得
+    连隐藏测试都能过、或冒烟测试开始报红，这个任务就失去考察意义了。两条都钉住。
+    """
+    task = load_task(TASK04)
+    ws = _fresh_ws(tmp_path, task)
+
+    ver = run_verifier(task, ws, baseline_sha=sha256_of_dir(task.tests_dir))
+    assert ver.verdict == "FAIL", "初始代码不该通过隐藏验收"
+    assert ver.tests_passed <= 3, \
+        f"初始代码通过过多隐藏断言: {ver.tests_passed}/{ver.tests_total}"
+
+    passed, total, log = run_tests(ws, task.workspace_src / "tests_local")
+    assert (passed, total) == (2, 2), log[-400:]

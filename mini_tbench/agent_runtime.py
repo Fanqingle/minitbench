@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -201,12 +202,31 @@ def _bounded(text: str, limit: int = _MAX_OBS_CHARS) -> tuple[str, bool]:
     return f"{head}\n...[{len(text) - limit} chars elided]...\n{tail}", True
 
 
+def _prepend_interpreter_dir(path: str) -> str:
+    """把 harness 解释器所在目录置于 PATH 最前，使 agent 与 verifier 同环境。
+
+    实测踩到的坑：pytest 等任务依赖装在 harness 的解释器里，而 agent 执行
+    `python3 -m pytest` 走 PATH 命中的是**另一个**解释器（系统 python），
+    于是报 "No module named pytest"。后果不只是多花几步——agent 会因此
+    放弃跑测试、退化成「盲改」，轨迹里表现为 environment 类噪音掩盖了
+    真实的 logic_error。让两者指向同一解释器，这条噪音才消失。
+    """
+    d = str(Path(sys.executable).resolve().parent)
+    parts = [p for p in (path or "").split(os.pathsep) if p]
+    if d in parts:
+        return path
+    return os.pathsep.join([d, *parts])
+
+
 def _tool_bash(ws: Path, args: dict) -> str:
     cmd = str(args.get("cmd", "")).strip()
     if not cmd:
         raise ToolError("bash: empty cmd")
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PATH"] = _prepend_interpreter_dir(env.get("PATH", ""))
+    # 供任务 README / 指令引用：显式给一个与 verifier 同源的解释器
+    env["MTB_PY"] = sys.executable
     try:
         r = _run_shell(cmd, ws, env, _BASH_TIMEOUT)
     except subprocess.TimeoutExpired:
